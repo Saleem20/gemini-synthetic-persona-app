@@ -1,241 +1,104 @@
+"""Thin wrapper around the OpenAI API for synthetic persona simulation.
+
+Replaces gemini_client.py / claude_client.py. Same public interface
+(constructor + generate_persona_response) so test_engine.py only needs
+the import line changed.
+
+Uses OpenAI's JSON mode for reliable structured output - no regex needed.
+"""
+
 from __future__ import annotations
 
 import json
 import os
 import re
-import time
-from statistics import mean
+from typing import Any, Dict, Optional
 
-import google.generativeai as genai
-import pandas as pd
-import streamlit as st
-from google.api_core.exceptions import NotFound, ResourceExhausted
+from openai import OpenAI
 
-st.set_page_config(page_title="Gemini Synthetic Persona Lab", layout="wide")
-
-PERSONAS = [
-    {"id": "mum", "name": "Sarah M.", "label": "Health-First Mum", "country": "AU"},
-    {"id": "senior", "name": "Raj P.", "label": "Budget Senior", "country": "AU"},
-    {"id": "exec", "name": "Marcus B.", "label": "Busy Executive", "country": "US"},
-    {"id": "genz", "name": "Aisha K.", "label": "Gen Z Ingredient Hunter", "country": "UK"},
-    {"id": "prag", "name": "David L.", "label": "Skeptical Pragmatist", "country": "US"},
+# Models in order of cost (cheapest first). Pick via constructor or sidebar.
+AVAILABLE_MODELS = [
+    "gpt-4o-mini",        # Cheapest, fast, fine for screening
+    "gpt-4o",             # Balanced quality and cost
+    "gpt-4.1-mini",       # Newer cheap option (if your account has access)
+    "gpt-4.1",            # Newer flagship
+    "gpt-5-mini",         # If available on your account
+    "gpt-5",              # Highest quality
 ]
 
-SUBCATEGORIES = {
-    "Oral Health": ["Daily toothpaste", "Whitening", "Sensitivity", "Mouthwash / rinse"],
-    "OTC": ["Pain relief / analgesics", "Cold & flu", "Digestive", "Allergy / hay fever"],
-    "Wellness": ["Adult multivitamins", "Immunity", "Sleep & mood", "Sports nutrition"],
-}
-
-JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
+DEFAULT_MODEL = "gpt-4o-mini"
+DEFAULT_MAX_TOKENS = 1024
 
 
-def get_api_key() -> str:
-    try:
-        key = st.secrets.get("GEMINI_API_KEY", "")  # type: ignore[attr-defined]
-        if key:
-            return key
-    except Exception:
-        pass
-    return os.getenv("GEMINI_API_KEY", "")
+class OpenAIClient:
+    """Minimal wrapper around openai.OpenAI for persona simulation."""
 
-
-def parse_json(text: str) -> dict:
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.strip("`")
-        if cleaned.lower().startswith("json"):
-            cleaned = cleaned[4:].lstrip()
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        match = JSON_RE.search(cleaned)
-        if not match:
-            raise RuntimeError("Model output did not contain valid JSON.")
-        return json.loads(match.group(0))
-
-
-def build_prompts(persona: dict, category: str, subcategory: str, subject: str) -> tuple[str, str]:
-    system = (
-        f"You are {persona['name']} ({persona['label']}) from {persona['country']}. "
-        "Respond as a real consumer in first person. Return JSON only."
-    )
-    user = f"""
-Evaluate this claim/name for {category} -> {subcategory}.
-
-Subject: "{subject}"
-
-Return JSON with:
-{{
-  "scores": {{
-    "believability": 1-7,
-    "relevance": 1-7,
-    "clarity": 1-7,
-    "differentiation": 1-7,
-    "purchase_intent": 1-7
-  }},
-  "verbatim": "2 short sentences",
-  "top_positive": "one sentence",
-  "top_concern": "one sentence"
-}}
-"""
-    return system, user
-
-
-def evaluate_persona(model_name: str, persona: dict, category: str, subcategory: str, subject: str) -> dict:
-    system, user = build_prompts(persona, category, subcategory, subject)
-    model = genai.GenerativeModel(model_name=model_name, system_instruction=system)
-
-    last_error = None
-    for attempt in range(3):
-        try:
-            response = model.generate_content(user)
-            payload = parse_json(response.text or "")
-            scores = payload["scores"]
-            overall = round(
-                mean(
-                    [
-                        scores["believability"],
-                        scores["relevance"],
-                        scores["clarity"],
-                        scores["differentiation"],
-                        scores["purchase_intent"],
-                    ]
-                ),
-                2,
+    def __init__(self, api_key: Optional[str] = None, model: str = DEFAULT_MODEL) -> None:
+        resolved_key = api_key or os.getenv("OPENAI_API_KEY")
+        if not resolved_key:
+            raise ValueError(
+                "Missing OpenAI API key. The app owner needs to add OPENAI_API_KEY "
+                "to Streamlit Cloud secrets or the local environment."
             )
-            return {
-                "persona": persona["name"],
-                "segment": persona["label"],
-                "country": persona["country"],
-                "overall": overall,
-                "believability": scores.get("believability"),
-                "relevance": scores.get("relevance"),
-                "clarity": scores.get("clarity"),
-                "differentiation": scores.get("differentiation"),
-                "purchase_intent": scores.get("purchase_intent"),
-                "verbatim": payload.get("verbatim", ""),
-                "top_positive": payload.get("top_positive", ""),
-                "top_concern": payload.get("top_concern", ""),
-                "ok": True,
-                "error": "",
-            }
-        except ResourceExhausted as exc:
-            last_error = f"Quota/rate-limit: {exc}"
-            time.sleep(2 * (attempt + 1))
-        except NotFound as exc:
-            last_error = f"Model not found: {exc}"
-            break
-        except Exception as exc:  # noqa: BLE001
-            last_error = str(exc)
-            break
+        self.client = OpenAI(api_key=resolved_key)
+        self.model = model
 
-    return {
-        "persona": persona["name"],
-        "segment": persona["label"],
-        "country": persona["country"],
-        "overall": None,
-        "believability": None,
-        "relevance": None,
-        "clarity": None,
-        "differentiation": None,
-        "purchase_intent": None,
-        "verbatim": "",
-        "top_positive": "",
-        "top_concern": "",
-        "ok": False,
-        "error": last_error or "Unknown error",
-    }
+    # ------------------------------------------------------------------
+    # Public
+    # ------------------------------------------------------------------
 
+    def generate_persona_response(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+        temperature: float = 0.7,
+    ) -> Dict[str, Any]:
+        """Call OpenAI and return the parsed JSON payload.
 
-def run_batch(model_name: str, personas: list[dict], category: str, subcategory: str, subject: str) -> list[dict]:
-    rows = []
-    for persona in personas:
-        rows.append(evaluate_persona(model_name, persona, category, subcategory, subject))
-        time.sleep(0.4)
-    rows.sort(key=lambda row: row["persona"])
-    return rows
-
-
-def main() -> None:
-    st.title("Gemini Synthetic Persona Lab")
-    st.caption("Backend-managed Gemini key only. This version is tuned for quota safety.")
-
-    api_key = get_api_key()
-    if not api_key:
-        st.error("Missing GEMINI_API_KEY in secrets or environment.")
-        st.stop()
-    genai.configure(api_key=api_key)
-
-    st.sidebar.header("Setup")
-    model_name = st.sidebar.selectbox(
-        "Model",
-        ["gemini-1.5-flash-latest", "gemini-1.5-pro-latest"],
-        index=0,
-    )
-    countries = st.sidebar.multiselect("Country filter", ["AU", "US", "UK"], default=["AU", "US"])
-    selected_personas = [p for p in PERSONAS if p["country"] in countries]
-    max_personas = st.sidebar.slider("Max personas per run", min_value=1, max_value=5, value=2, step=1)
-    selected_personas = selected_personas[:max_personas]
-
-    col1, col2 = st.columns(2)
-    with col1:
-        category = st.selectbox("Category", list(SUBCATEGORIES.keys()))
-    with col2:
-        subcategory = st.selectbox("Sub-category", SUBCATEGORIES[category])
-
-    subject = st.text_area("Claim or name", placeholder="Type claim or product name...")
-    run = st.button("Run test", type="primary", use_container_width=True)
-
-    if not run:
-        return
-
-    if not subject.strip():
-        st.warning("Enter a claim or name first.")
-        st.stop()
-    if not selected_personas:
-        st.warning("Select at least one country/persona.")
-        st.stop()
-
-    with st.spinner("Running persona evaluations..."):
-        rows = run_batch(model_name, selected_personas, category, subcategory, subject.strip())
-
-    ok_rows = [row for row in rows if row.get("ok")]
-    err_rows = [row for row in rows if not row.get("ok")]
-
-    if err_rows:
-        st.warning(f"{len(err_rows)} persona call(s) failed. Showing successful results only.")
-        st.dataframe(
-            pd.DataFrame(err_rows)[["persona", "country", "error"]],
-            use_container_width=True,
+        Uses response_format={"type": "json_object"} so the model returns
+        valid JSON without code fences. Falls back to tolerant parsing
+        on rare malformed output.
+        """
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=max_tokens,
+            temperature=temperature,
+            response_format={"type": "json_object"},
         )
 
-    if not ok_rows:
-        st.error("All persona calls failed. Wait 1-2 minutes and retry.")
-        st.stop()
-
-    df = pd.DataFrame(ok_rows)
-    st.subheader("Results")
-    st.metric("Overall mean", round(df["overall"].mean(), 2))
-    st.dataframe(
-        df.drop(columns=["verbatim", "top_positive", "top_concern", "ok", "error"]),
-        use_container_width=True,
-    )
-
-    st.subheader("Verbatims")
-    for row in ok_rows:
-        with st.expander(f"{row['persona']} — {row['segment']} ({row['country']})"):
-            st.write(row["verbatim"])
-            st.write(f"Top positive: {row['top_positive']}")
-            st.write(f"Top concern: {row['top_concern']}")
-
-    st.download_button(
-        "Download results JSON",
-        data=json.dumps(rows, indent=2).encode("utf-8"),
-        file_name="gemini_persona_results.json",
-        mime="application/json",
-    )
+        text = (response.choices[0].message.content or "").strip()
+        return _parse_json_payload(text)
 
 
-if __name__ == "__main__":
-    main()
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+_JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
+
+
+def _parse_json_payload(text: str) -> Dict[str, Any]:
+    """Tolerant JSON parser.
+
+    JSON mode normally returns clean JSON. This fallback only triggers
+    if a model variant ignores the format hint.
+    """
+    candidate = text.strip()
+    if candidate.startswith("```"):
+        candidate = candidate.strip("`")
+        if candidate.lower().startswith("json"):
+            candidate = candidate[4:].lstrip()
+
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        match = _JSON_BLOCK_RE.search(candidate)
+        if not match:
+            raise RuntimeError(f"Could not find a JSON object in model output:\n{text}")
+        return json.loads(match.group(0))
